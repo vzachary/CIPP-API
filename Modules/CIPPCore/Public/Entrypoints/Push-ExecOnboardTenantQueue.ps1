@@ -4,11 +4,11 @@ Function Push-ExecOnboardTenantQueue {
     Entrypoint
     #>
     [CmdletBinding()]
-    param($QueueItem, $TriggerMetadata)
+    param($Item)
     try {
         $DateFormat = '%Y-%m-%d %H:%M:%S'
-        $Id = $QueueItem.id
-        #Write-Host ($QueueItem.Roles | ConvertTo-Json)
+        $Id = $Item.id
+        #Write-Host ($Item.Roles | ConvertTo-Json)
         $Start = Get-Date
         $Logs = [System.Collections.Generic.List[object]]::new()
         $OnboardTable = Get-CIPPTable -TableName 'TenantOnboarding'
@@ -117,7 +117,7 @@ Function Push-ExecOnboardTenantQueue {
         if ($OnboardingSteps.Step2.Status -eq 'succeeded') {
             $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Checking group mapping' })
             $AccessAssignments = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships/$Id/accessAssignments"
-            if ($AccessAssignments.id -and $QueueItem.AutoMapRoles -ne $true) {
+            if ($AccessAssignments.id -and $Item.AutoMapRoles -ne $true) {
                 $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Groups mapped' })
                 $OnboardingSteps.Step3.Status = 'succeeded'
                 $OnboardingSteps.Step3.Message = 'Your GDAP relationship already has mapped security groups'
@@ -136,8 +136,8 @@ Function Push-ExecOnboardTenantQueue {
                     $MissingRoles = [System.Collections.Generic.List[object]]::new()
                     $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Relationship has existing access assignments, checking for missing mappings' })
                     #Write-Host ($AccessAssignments | ConvertTo-Json -Depth 5)
-                    if ($QueueItem.Roles -and $QueueItem.AutoMapRoles -eq $true) {
-                        foreach ($Role in $QueueItem.Roles) {
+                    if ($Item.Roles -and $Item.AutoMapRoles -eq $true) {
+                        foreach ($Role in $Item.Roles) {
                             if ($AccessAssignments.accessContainer.accessContainerid -notcontains $Role.GroupId -and $Relationship.accessDetails.unifiedRoles.roleDefinitionId -contains $Role.roleDefinitionId) {
                                 $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = "Adding missing group to relationship: $($Role.GroupName)" })
                                 $MissingRoles.Add([PSCustomObject]$Role)
@@ -161,16 +161,16 @@ Function Push-ExecOnboardTenantQueue {
                     }
                 }
 
-                if (!$AccessAssignments.id -and !$Invite -and $QueueItem.Roles) {
+                if (!$AccessAssignments.id -and !$Invite -and $Item.Roles) {
                     $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'No access assignments found, using defined role mapping.' })
                     $MatchingRoles = [System.Collections.Generic.List[object]]::new()
-                    foreach ($Role in $QueueItem.Roles) {
+                    foreach ($Role in $Item.Roles) {
                         if ($Relationship.accessDetails.unifiedRoles.roleDefinitionId -contains $Role.roleDefinitionId) {
                             $MatchingRoles.Add([PSCustomObject]$Role)
                         }
                     }
 
-                    if (($MatchingRoles | Measure-Object).Count -gt 0 -and $QueueItem.AutoMapRoles -eq $true) {
+                    if (($MatchingRoles | Measure-Object).Count -gt 0 -and $Item.AutoMapRoles -eq $true) {
                         $Invite = [PSCustomObject]@{
                             'PartitionKey' = 'invite'
                             'RowKey'       = $Id
@@ -224,11 +224,11 @@ Function Push-ExecOnboardTenantQueue {
                 if ($AccessAssignments.status -notcontains 'pending') {
                     $OnboardingSteps.Step3.Message = 'Group check: Access assignments are mapped and active'
                     $OnboardingSteps.Step3.Status = 'succeeded'
-                    if ($QueueItem.AddMissingGroups -eq $true) {
+                    if ($Item.AddMissingGroups -eq $true) {
                         $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Checking for missing groups for SAM user' })
                         $SamUserId = (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/me?`$select=id").id
                         $CurrentMemberships = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/me/transitiveMemberOf?`$select=id,displayName"
-                        foreach ($Role in $QueueItem.Roles) {
+                        foreach ($Role in $Item.Roles) {
                             if ($CurrentMemberships.id -notcontains $Role.GroupId) {
                                 $PostBody = @{
                                     '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/{0}' -f $SamUserId
@@ -263,72 +263,87 @@ Function Push-ExecOnboardTenantQueue {
             $TenantOnboarding.Logs = [string](ConvertTo-Json -InputObject @($Logs) -Compress)
             Add-CIPPAzDataTableEntity @OnboardTable -Entity $TenantOnboarding -Force -ErrorAction Stop
 
-            $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Clearing tenant cache' })
-            $y = 0
-            do {
-                try {
-                    Remove-CIPPCache -tenantsOnly $true
-                } catch {}
+            $IsExcluded = (Get-Tenants -SkipList | Where-Object { $_.customerId -eq $Relationship.customer.tenantId } | Measure-Object).Count -gt 0
+            if ($IsExcluded) {
+                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Tenant is excluded from CIPP, onboarding cannot continue.' })
+                $TenantOnboarding.Status = 'failed'
+                $OnboardingSteps.Step4.Status = 'failed'
+                $OnboardingSteps.Step4.Message = 'Tenant excluded from CIPP, remove the exclusion and retry onboarding.'
+            } else {
 
-                $Tenant = Get-Tenants | Where-Object { $_.customerId -eq $Relationship.customer.tenantId } | Select-Object -First 1
-                $y++
-                Start-Sleep -Seconds 20
-            } while (!$Tenant -and $y -le 4)
+                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Clearing tenant cache' })
+                $y = 0
+                do {
+                    try {
+                        Remove-CIPPCache -tenantsOnly $true
+                    } catch {}
 
-            if ($Tenant) {
-                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Tenant found in customer list' })
-                try {
-                    $CPVConsentParams = @{
-                        TenantFilter = $Tenant.defaultDomainName
+                    $Tenant = Get-Tenants -IncludeAll | Where-Object { $_.customerId -eq $Relationship.customer.tenantId } | Select-Object -First 1
+                    $y++
+                    Start-Sleep -Seconds 20
+                } while (!$Tenant -and $y -le 4)
+
+                if ($Tenant) {
+                    $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Tenant found in customer list' })
+                    try {
+                        $CPVConsentParams = @{
+                            TenantFilter = $Relationship.customer.tenantId
+                        }
+                        $Consent = Set-CIPPCPVConsent @CPVConsentParams
+                        if ($Consent -match 'Could not add our Service Principal to the client tenant') {
+                            throw
+                        }
+                        $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Added initial CPV consent permissions' })
+                    } catch {
+                        $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'CPV Consent Failed' })
+                        $TenantOnboarding.Status = 'failed'
+                        $OnboardingSteps.Step4.Status = 'failed'
+                        $OnboardingSteps.Step4.Message = 'CPV Consent failed, check the App Registration in your partner tenant for missing admin consent.'
+                        $TenantOnboarding.OnboardingSteps = [string](ConvertTo-Json -InputObject $OnboardingSteps -Compress)
+                        $TenantOnboarding.Logs = [string](ConvertTo-Json -InputObject @($Logs) -Compress)
+                        Add-CIPPAzDataTableEntity @OnboardTable -Entity $TenantOnboarding -Force -ErrorAction Stop
+                        return
                     }
-                    $Consent = Set-CIPPCPVConsent @CPVConsentParams
-                    if ($Consent -match 'Could not add our Service Principal to the client tenant') {
-                        throw
-                    }
-                    $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Added initial CPV consent permissions' })
-                } catch {
-                    $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'CPV Consent Failed' })
-                    $TenantOnboarding.Status = 'failed'
-                    $OnboardingSteps.Step4.Status = 'failed'
-                    $OnboardingSteps.Step4.Message = 'CPV Consent failed, check the App Registration in your partner tenant for missing admin consent.'
+                    $Refreshing = $true
+                    $CPVSuccess = $false
+                    $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Refreshing CPV permissions' })
+                    $OnboardingSteps.Step4.Message = 'Refreshing CPV permissions'
                     $TenantOnboarding.OnboardingSteps = [string](ConvertTo-Json -InputObject $OnboardingSteps -Compress)
                     $TenantOnboarding.Logs = [string](ConvertTo-Json -InputObject @($Logs) -Compress)
                     Add-CIPPAzDataTableEntity @OnboardTable -Entity $TenantOnboarding -Force -ErrorAction Stop
-                    return
-                }
-                $Refreshing = $true
-                $CPVSuccess = $false
-                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Refreshing CPV permissions' })
-                $OnboardingSteps.Step4.Message = 'Refreshing CPV permissions'
-                $TenantOnboarding.OnboardingSteps = [string](ConvertTo-Json -InputObject $OnboardingSteps -Compress)
-                $TenantOnboarding.Logs = [string](ConvertTo-Json -InputObject @($Logs) -Compress)
-                Add-CIPPAzDataTableEntity @OnboardTable -Entity $TenantOnboarding -Force -ErrorAction Stop
-                do {
-                    try {
-                        Add-CIPPApplicationPermission -RequiredResourceAccess 'CippDefaults' -ApplicationId $ENV:ApplicationID -tenantfilter $Tenant.defaultDomainName
-                        Add-CIPPDelegatedPermission -RequiredResourceAccess 'CippDefaults' -ApplicationId $ENV:ApplicationID -tenantfilter $Tenant.defaultDomainName
-                        $CPVSuccess = $true
-                        $Refreshing = $false
-                    } catch {
-                        Start-Sleep -Seconds 30
-                    }
-                } while ($Refreshing -and (Get-Date) -lt $Start.AddMinutes(8))
+                    do {
+                        try {
+                            Add-CIPPApplicationPermission -RequiredResourceAccess 'CippDefaults' -ApplicationId $ENV:ApplicationID -tenantfilter $Relationship.customer.tenantId
+                            Add-CIPPDelegatedPermission -RequiredResourceAccess 'CippDefaults' -ApplicationId $ENV:ApplicationID -tenantfilter $Relationship.customer.tenantId
+                            $CPVSuccess = $true
+                            $Refreshing = $false
+                        } catch {
+                            Start-Sleep -Seconds 30
+                        }
+                    } while ($Refreshing -and (Get-Date) -lt $Start.AddMinutes(8))
 
-                if ($CPVSuccess) {
-                    $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'CPV permissions refreshed' })
-                    $OnboardingSteps.Step4.Status = 'succeeded'
-                    $OnboardingSteps.Step4.Message = 'CPV permissions refreshed'
+                    if ($CPVSuccess) {
+                        $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'CPV permissions refreshed' })
+                        $OnboardingSteps.Step4.Status = 'succeeded'
+                        $OnboardingSteps.Step4.Message = 'CPV permissions refreshed'
+                        if ($Tenant.defaultDomainName -match 'Domain Error') {
+                            try {
+                                Remove-CIPPCache -tenantsOnly $true
+                            } catch {}
+                            $Tenant = Get-Tenants -IncludeAll | Where-Object { $_.customerId -eq $Relationship.customer.tenantId } | Select-Object -First 1
+                        }
+                    } else {
+                        $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'CPV permissions failed to refresh' })
+                        $TenantOnboarding.Status = 'failed'
+                        $OnboardingSteps.Step4.Status = 'failed'
+                        $OnboardingSteps.Step4.Message = 'CPV permissions failed to refresh, try again later'
+                    }
                 } else {
-                    $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'CPV permissions failed to refresh' })
+                    $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Tenant not found' })
                     $TenantOnboarding.Status = 'failed'
                     $OnboardingSteps.Step4.Status = 'failed'
-                    $OnboardingSteps.Step4.Message = 'CPV permissions failed to refresh, try again later'
+                    $OnboardingSteps.Step4.Message = 'Tenant not found in customer list, try again later'
                 }
-            } else {
-                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Tenant not found' })
-                $TenantOnboarding.Status = 'failed'
-                $OnboardingSteps.Step4.Status = 'failed'
-                $OnboardingSteps.Step4.Message = 'Tenant not found in customer list, try again later'
             }
             $TenantOnboarding.OnboardingSteps = [string](ConvertTo-Json -InputObject $OnboardingSteps -Compress)
             $TenantOnboarding.Logs = [string](ConvertTo-Json -InputObject @($Logs) -Compress)
