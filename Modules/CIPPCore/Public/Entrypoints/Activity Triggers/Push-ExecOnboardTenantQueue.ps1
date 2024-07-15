@@ -264,21 +264,21 @@ Function Push-ExecOnboardTenantQueue {
             $TenantOnboarding.Logs = [string](ConvertTo-Json -InputObject @($Logs) -Compress)
             Add-CIPPAzDataTableEntity @OnboardTable -Entity $TenantOnboarding -Force -ErrorAction Stop
 
-            $IsExcluded = (Get-Tenants -SkipList | Where-Object { $_.customerId -eq $Relationship.customer.tenantId } | Measure-Object).Count -gt 0
+            $ExcludedTenant = Get-Tenants -SkipList | Where-Object { $_.customerId -eq $Relationship.customer.tenantId }
+            $IsExcluded = ($ExcludedTenant | Measure-Object).Count -gt 0
             if ($IsExcluded) {
-                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Tenant is excluded from CIPP, onboarding cannot continue.' })
+                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = ('Tenant is excluded from CIPP, onboarding cannot continue. Remove the exclusion from "{0}" ({1})' -f $ExcludedTenant.displayName, $ExcludedTenant.customerId) })
                 $TenantOnboarding.Status = 'failed'
                 $OnboardingSteps.Step4.Status = 'failed'
                 $OnboardingSteps.Step4.Message = 'Tenant excluded from CIPP, remove the exclusion and retry onboarding.'
             } else {
-
                 $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Clearing tenant cache' })
                 $y = 0
                 do {
                     $Tenant = Get-Tenants -TriggerRefresh -IncludeAll | Where-Object { $_.customerId -eq $Relationship.customer.tenantId } | Select-Object -First 1
                     $y++
                     Start-Sleep -Seconds 20
-                } while (!$Tenant -and $y -le 4)
+                } while (!$Tenant -and $y -le 10)
 
                 if ($Tenant) {
                     $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Tenant found in customer list' })
@@ -346,6 +346,29 @@ Function Push-ExecOnboardTenantQueue {
         }
 
         if ($OnboardingSteps.Step4.Status -eq 'succeeded') {
+            if ($Item.StandardsExcludeAllTenants -eq $true) {
+                $Settings = @{
+                    'OverrideAllTenants' = @{
+                        'remediate' = $true
+                    }
+                }
+                $object = [PSCustomObject]@{
+                    Tenant    = $Tenant.defaultDomainName
+                    AddedBy   = 'Onboarding'
+                    AppliedAt = (Get-Date).ToString('s')
+                    Standards = $Settings
+                    v2        = $true
+                } | ConvertTo-Json -Depth 10
+
+                $Table = Get-CippTable -tablename 'standards'
+                $Table.Force = $true
+                Add-CIPPAzDataTableEntity @Table -Entity @{
+                    JSON         = "$object"
+                    RowKey       = [string]$Tenant.defaultDomainName
+                    PartitionKey = 'standards'
+                }
+                $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = 'Set All Tenant Standards Exclusion' })
+            }
             $Logs.Add([PSCustomObject]@{ Date = Get-Date -UFormat $DateFormat; Log = "Testing API access for $($Tenant.defaultDomainName)" })
             $OnboardingSteps.Step5.Status = 'running'
             $OnboardingSteps.Step5.Message = 'Testing API access'
